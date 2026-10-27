@@ -1,0 +1,6 @@
+<launch>
+  <arg name="audio_device" default="default" />
+  <node pkg="uav_audio" type="audio_node" name="audio_node" output="screen">
+    <param name="audio_device" value="$(arg audio_device)" />
+  </node>
+</launch>

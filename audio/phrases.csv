@@ -1,0 +1,16 @@
+﻿filename,text
+cn-ready.wav,飞行系统已就绪。
+cn-armed.wav,飞机已解锁，请远离飞行器！
+cn-takeoff.wav,飞机即将起飞，请保持安全距离！
+cn-mission-start.wav,开始执行任务。
+cn-target-found.wav,发现目标，开始执行任务。
+cn-target-lost.wav,目标丢失，正在重新搜索。
+cn-mission-complete.wav,任务执行完成。
+cn-return.wav,飞机正在返航，请保持降落区域畅通。
+cn-landing.wav,飞机即将降落，请远离降落区域！
+cn-disarmed.wav,飞机已上锁。
+cn-battery-low.wav,电量偏低，请尽快降落。
+cn-battery-critical.wav,电量严重不足，立即降落！
+cn-fault.wav,出现一般故障，请立即降落！
+cn-fault-critical.wav,出现严重故障，立即降落！
+cn-welcome.wav,欢迎使用段家威飞行器。
