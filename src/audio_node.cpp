@@ -56,17 +56,12 @@ void waitForPlayback(pid_t pid) {
     wake_waiter.wait_for(lock, std::chrono::milliseconds(20));
   }
   child_pid = -1;
+  wake_waiter.notify_all();
 }
 
 bool play(uav_audio::PlayAudio::Request& request,
           uav_audio::PlayAudio::Response& response) {
-  std::lock_guard<std::mutex> lock(state_mutex);
-  if (child_pid > 0) {
-    return reject(response, "Audio device busy");
-  }
-  if (waiter.joinable()) {
-    waiter.join();
-  }
+  std::unique_lock<std::mutex> lock(state_mutex);
 
   const std::string& name = request.filename;
   if (name.size() <= 4 || name.find_first_of("/\\") != std::string::npos ||
@@ -113,7 +108,21 @@ bool play(uav_audio::PlayAudio::Request& request,
   char* arguments[] = {program, device_option, const_cast<char*>(audio_device.c_str()),
                        type_option, type, nullptr};
   pid_t pid = -1;
+  if (error == 0 && child_pid > 0) {
+    // Stop only our validated, unreaped child; invalid requests leave it playing.
+    if (kill(child_pid, SIGKILL) < 0 && errno != ESRCH) {
+      error = errno;
+    } else {
+      ROS_INFO("Preempting current playback");
+      wake_waiter.notify_one();
+      // Release the mutex so the waiter can reap the child before replacement.
+      wake_waiter.wait(lock, [] { return child_pid < 0; });
+    }
+  }
   if (error == 0) {
+    if (waiter.joinable()) {
+      waiter.join();
+    }
     error = posix_spawnp(&pid, program, &actions, nullptr, arguments, environ);
   }
   posix_spawn_file_actions_destroy(&actions);

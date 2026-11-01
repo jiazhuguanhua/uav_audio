@@ -1,6 +1,6 @@
 # uav_audio
 
-ROS1 Noetic / C++14 最简 WAV 播放服务，使用 `aplay`，一次只播放一个文件。
+ROS1 Noetic / C++14 最简 WAV 播放服务，使用 `aplay`，一次只播放一个文件；新的有效请求会抢占当前播放。
 音频目录包含之前验证过的 `audio/sample-6s.wav`，以及从 `drone-voice-cn.zip`
 导入的 15 条 `cn-*.wav` 中文提示音；文件名与文案见 [audio/phrases.csv](audio/phrases.csv)。
 
@@ -50,7 +50,8 @@ rosservice call /audio/play "filename: '../sample-6s.wav'"
 响应 `bool success` 和 `string message`。
 
 - 成功启动子进程：`true / Playback started`，立即返回，不等待播放完成。
-- 当前正在播放：`false / Audio device busy`。结束后自动恢复空闲。
+- 当前正在播放：新的有效请求会立即终止并回收旧播放器，再启动新播放，返回 `true / Playback started`；不排队，旧音频不会恢复。
+- 文件名或文件检查失败的请求返回 `false`，不会中断当前播放。
 - 文件不存在、不可读、非普通文件或进程无法启动：`false`，附具体错误并记录 ROS 日志。
 - 仅接受以小写 `.wav` 结尾的纯文件名；拒绝 `/`、`\`、`..`、NUL 和符号链接。
 - 文件从包内 `audio/` 打开并通过描述符交给 `aplay`，不调用 Shell。
@@ -59,6 +60,16 @@ rosservice call /audio/play "filename: '../sample-6s.wav'"
 - 节点关闭时终止并回收其播放子进程，等待线程退出。
 
 添加自己的 WAV 时放到本包 `audio/` 目录，然后以其文件名调用服务。
+
+## 抢占播放自测（2026-11-01）
+
+在 WSL Ubuntu 20.04 / ROS Noetic 的独立 Master 上编译并验证：
+
+- 使用可控播放器验证连续 100 次抢占、8 个并发请求、同文件重新播放、旧进程回收及关闭清理；无效请求保持原播放。
+- 使用真实 `aplay` 经 ALSA `null` 成功播放全部 17 个 WAV；经 WSLg PulseAudio 验证播放中切换，新请求响应约 28.5 ms，替换音频正常结束。
+- 缺少播放器、播放器异常退出、无效音频设备后的错误处理和后续播放恢复均通过。
+
+本次验证不包含飞机喇叭的声学测量。以下 2026-10-27 记录对应修改前的拒绝忙碌请求行为。
 
 ## 实机自测（2026-10-27）
 
