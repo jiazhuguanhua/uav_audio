@@ -12,12 +12,11 @@ aplay -l       # 硬件声卡
 aplay -L       # 可用于 -D 的 ALSA 设备名
 ```
 
-`~audio_device` 默认 `default`，对应 **ALSA 默认设备**。
-本机 `/etc/asound.conf` 将它设为 Jetson APE 内置声卡；桌面的 USB 默认输出
-由 PulseAudio 管理，因此本机 USB 喇叭建议用 `audio_device:=pulse`。
-也可使用 `audio_device:=plughw:CARD=Device,DEV=0` 直接访问 USB 声卡，
-但直接访问时设备不能被 PulseAudio 或其他程序独占。
-此包不修改系统音频配置。
+`~audio_device` 默认通过 PulseAudio 连接本机 USB 小音箱
+`alsa_output.usb-Generic_USB2.0_Device_20170726905923-01.iec958-stereo`。
+更换设备后，可以用 `pactl list short sinks` 查看输出名，再传入
+`audio_device:=pulse:DEVICE=<输出名>`。跟随 PulseAudio 系统默认输出时用
+`audio_device:=pulse`，使用 ALSA 默认设备时用 `audio_device:=default`。
 
 ## 编译
 
@@ -32,10 +31,9 @@ source devel/setup.bash
 
 ```bash
 source ~/devices_ws/setup_devices.bash
-roslaunch uav_audio audio.launch audio_device:=pulse
+roslaunch uav_audio audio.launch
 ```
 
-如 ALSA 默认设备已经正确配置，可直接 `roslaunch uav_audio audio.launch`。
 另一个终端：
 
 ```bash
@@ -72,7 +70,7 @@ cd ~/devices_ws
 source /opt/ros/noetic/setup.bash
 catkin_make -DROS_EDITION=ROS1 -DSHERPA_ONNX_ROOT=/绝对路径/SDK解压目录 -j4
 source devel/setup.bash
-roslaunch uav_audio audio.launch audio_device:=pulse tts_model_dir:=/绝对路径/vits-melo-tts-zh_en
+roslaunch uav_audio audio.launch tts_model_dir:=/绝对路径/vits-melo-tts-zh_en
 ```
 
 在另一个已加载工作区环境的终端调用：
@@ -82,6 +80,8 @@ rosservice call /audio/say "text: '系统已就绪。This is a test.'"
 ```
 
 `/audio/say` 接受最多 512 字节的 UTF-8 文本，返回合成并启动播放的结果。
+默认语速为 `0.8`，可用 `tts_speed:=1.0` 恢复模型的标准语速。
+合成音频采用满幅峰值归一化，实际播放音量由输出设备控制。
 一次合成一条。若合成完成时播放器正忙，本次播报返回失败。固定 WAV 仍可按原方式抢占播放。
 仅使用 WAV 时省略 `tts_model_dir`，也可将 `SHERPA_ONNX_ROOT` 置空以去掉编译依赖。
 

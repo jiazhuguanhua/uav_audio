@@ -1,8 +1,10 @@
 <launch>
-  <arg name="audio_device" default="default" />
+  <arg name="audio_device" default="pulse:DEVICE=alsa_output.usb-Generic_USB2.0_Device_20170726905923-01.iec958-stereo" />
   <arg name="tts_model_dir" default="" />
+  <arg name="tts_speed" default="0.8" />
   <node pkg="uav_audio" type="audio_node" name="audio_node" output="screen">
     <param name="audio_device" value="$(arg audio_device)" />
     <param name="tts_model_dir" type="str" value="$(arg tts_model_dir)" />
+    <param name="tts_speed" type="double" value="$(arg tts_speed)" />
   </node>
 </launch>

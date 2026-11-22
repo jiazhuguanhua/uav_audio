@@ -7,6 +7,8 @@
 #include <sherpa-onnx/c-api/c-api.h>
 #include <uav_audio/Say.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <memory>
@@ -31,6 +33,8 @@
 extern char** environ;
 
 namespace {
+constexpr char kDefaultAudioDevice[] =
+    "pulse:DEVICE=alsa_output.usb-Generic_USB2.0_Device_20170726905923-01.iec958-stereo";
 std::string audio_directory;
 std::string audio_device;
 std::mutex playback_mutex;
@@ -171,6 +175,8 @@ bool play(uav_audio::PlayAudio::Request& request,
 #ifdef UAV_AUDIO_WITH_TTS
 class TextToSpeech {
  public:
+  explicit TextToSpeech(float speed) : speed_(speed) {}
+
   bool load(const std::string& directory) {
     const std::string model = directory + "/model.onnx";
     const std::string tokens = directory + "/tokens.txt";
@@ -210,13 +216,27 @@ class TextToSpeech {
     try {
       const std::unique_ptr<const SherpaOnnxGeneratedAudio,
                             decltype(&SherpaOnnxDestroyOfflineTtsGeneratedAudio)> audio(
-          SherpaOnnxOfflineTtsGenerate(tts_.get(), text.c_str(), 0, 1.0f),
+          SherpaOnnxOfflineTtsGenerate(tts_.get(), text.c_str(), 0, speed_),
           SherpaOnnxDestroyOfflineTtsGeneratedAudio);
       if (!audio || audio->n <= 0) {
         return reject(response, "MeloTTS generated no audio");
       }
+      float peak = 0.0f;
+      for (int i = 0; i < audio->n; ++i) {
+        const float magnitude = std::abs(audio->samples[i]);
+        if (!std::isfinite(magnitude)) {
+          return reject(response, "MeloTTS generated an invalid sample");
+        }
+        peak = std::max(peak, magnitude);
+      }
+      if (peak == 0.0f) {
+        return reject(response, "MeloTTS generated only silence");
+      }
+      std::vector<float> samples(audio->n);
+      std::transform(audio->samples, audio->samples + audio->n, samples.begin(),
+                     [peak](float sample) { return sample / peak; });
       std::vector<char> wav(SherpaOnnxWaveFileSize(audio->n));
-      SherpaOnnxWriteWaveToBuffer(audio->samples, audio->n, audio->sample_rate, wav.data());
+      SherpaOnnxWriteWaveToBuffer(samples.data(), audio->n, audio->sample_rate, wav.data());
 
       const int fd = memfd_create("uav_audio_tts", MFD_CLOEXEC);
       if (fd < 0) {
@@ -238,6 +258,7 @@ class TextToSpeech {
   }
 
  private:
+  const float speed_;
   std::mutex synthesis_mutex_;
   std::unique_ptr<const SherpaOnnxOfflineTts, decltype(&SherpaOnnxDestroyOfflineTts)> tts_{
       nullptr, SherpaOnnxDestroyOfflineTts};
@@ -249,7 +270,7 @@ int main(int argc, char** argv) {
   ros::init(argc, argv, "audio_node");
   ros::NodeHandle node;
   ros::NodeHandle private_node("~");
-  private_node.param<std::string>("audio_device", audio_device, "default");
+  private_node.param<std::string>("audio_device", audio_device, kDefaultAudioDevice);
   const std::string package_path = ros::package::getPath("uav_audio");
   if (package_path.empty() || audio_device.empty()) {
     ROS_FATAL("Cannot locate uav_audio or audio_device is empty");
@@ -261,7 +282,13 @@ int main(int argc, char** argv) {
   std::string tts_model_dir;
   private_node.getParam("tts_model_dir", tts_model_dir);
 #ifdef UAV_AUDIO_WITH_TTS
-  TextToSpeech tts;
+  float tts_speed;
+  private_node.param("tts_speed", tts_speed, 0.8f);
+  if (!std::isfinite(tts_speed) || tts_speed <= 0.0f) {
+    ROS_WARN("Invalid tts_speed, using 0.8");
+    tts_speed = 0.8f;
+  }
+  TextToSpeech tts(tts_speed);
   ros::CallbackQueue tts_queue;
   ros::AsyncSpinner tts_spinner(2, &tts_queue);
   ros::NodeHandle tts_node;
