@@ -2,6 +2,18 @@
 #include <ros/ros.h>
 #include <uav_audio/PlayAudio.h>
 
+#ifdef UAV_AUDIO_WITH_TTS
+#include <ros/callback_queue.h>
+#include <sherpa-onnx/c-api/c-api.h>
+#include <uav_audio/Say.h>
+
+#include <cstdio>
+#include <fstream>
+#include <memory>
+#include <sys/mman.h>
+#include <vector>
+#endif
+
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -21,12 +33,14 @@ extern char** environ;
 namespace {
 std::string audio_directory;
 std::string audio_device;
+std::mutex playback_mutex;
 std::mutex state_mutex;
 std::condition_variable wake_waiter;
 pid_t child_pid = -1;
 std::thread waiter;
 
-bool reject(uav_audio::PlayAudio::Response& response, const std::string& message) {
+template <typename Response>
+bool reject(Response& response, const std::string& message) {
   response.success = false;
   response.message = message;
   ROS_WARN_STREAM(message);
@@ -59,10 +73,67 @@ void waitForPlayback(pid_t pid) {
   wake_waiter.notify_all();
 }
 
+template <typename Response>
+bool startPlayback(int file, const std::string& name, bool preempt, Response& response) {
+  // Serialize requests even while waiting for the previous player to exit.
+  std::lock_guard<std::mutex> playback_lock(playback_mutex);
+  std::unique_lock<std::mutex> lock(state_mutex);
+  if (!preempt && child_pid > 0) {
+    return reject(response, "Playback busy");
+  }
+
+  // aplay reads the WAV through stdin.
+  posix_spawn_file_actions_t actions;
+  int error = posix_spawn_file_actions_init(&actions);
+  if (error != 0) {
+    return reject(response, std::string("Cannot prepare aplay: ") + std::strerror(error));
+  }
+  error = posix_spawn_file_actions_adddup2(&actions, file, STDIN_FILENO);
+  char program[] = "aplay";
+  char device_option[] = "-D";
+  char type_option[] = "-t";
+  char type[] = "wav";
+  char* arguments[] = {program, device_option, const_cast<char*>(audio_device.c_str()),
+                       type_option, type, nullptr};
+  pid_t pid = -1;
+  if (error == 0 && child_pid > 0) {
+    // Stop only our validated, unreaped child; invalid requests leave it playing.
+    if (kill(child_pid, SIGKILL) < 0 && errno != ESRCH) {
+      error = errno;
+    } else {
+      ROS_INFO("Preempting current playback");
+      wake_waiter.notify_one();
+      // Release the mutex so the waiter can reap the child before replacement.
+      wake_waiter.wait(lock, [] { return child_pid < 0; });
+    }
+  }
+  if (error == 0) {
+    if (waiter.joinable()) {
+      waiter.join();
+    }
+    error = posix_spawnp(&pid, program, &actions, nullptr, arguments, environ);
+  }
+  posix_spawn_file_actions_destroy(&actions);
+  if (error != 0) {
+    return reject(response, std::string("Cannot start aplay: ") + std::strerror(error));
+  }
+  child_pid = pid;
+  try {
+    waiter = std::thread(waitForPlayback, pid);
+  } catch (const std::exception& exception) {
+    kill(pid, SIGKILL);
+    while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+    child_pid = -1;
+    return reject(response, std::string("Cannot start playback waiter: ") + exception.what());
+  }
+  response.success = true;
+  response.message = "Playback started";
+  ROS_INFO_STREAM("Playback started: " << name << " (device=" << audio_device << ")");
+  return true;
+}
+
 bool play(uav_audio::PlayAudio::Request& request,
           uav_audio::PlayAudio::Response& response) {
-  std::unique_lock<std::mutex> lock(state_mutex);
-
   const std::string& name = request.filename;
   if (name.size() <= 4 || name.find_first_of("/\\") != std::string::npos ||
       name.find("..") != std::string::npos || name.find('\0') != std::string::npos ||
@@ -92,58 +163,86 @@ bool play(uav_audio::PlayAudio::Request& request,
                                 ? std::string("Cannot inspect WAV file: ") + std::strerror(stat_error)
                                 : "WAV file is not a regular file");
   }
-
-  // aplay reads the validated descriptor as stdin; no shell interprets the filename.
-  posix_spawn_file_actions_t actions;
-  int error = posix_spawn_file_actions_init(&actions);
-  if (error != 0) {
-    close(file);
-    return reject(response, std::string("Cannot prepare aplay: ") + std::strerror(error));
-  }
-  error = posix_spawn_file_actions_adddup2(&actions, file, STDIN_FILENO);
-  char program[] = "aplay";
-  char device_option[] = "-D";
-  char type_option[] = "-t";
-  char type[] = "wav";
-  char* arguments[] = {program, device_option, const_cast<char*>(audio_device.c_str()),
-                       type_option, type, nullptr};
-  pid_t pid = -1;
-  if (error == 0 && child_pid > 0) {
-    // Stop only our validated, unreaped child; invalid requests leave it playing.
-    if (kill(child_pid, SIGKILL) < 0 && errno != ESRCH) {
-      error = errno;
-    } else {
-      ROS_INFO("Preempting current playback");
-      wake_waiter.notify_one();
-      // Release the mutex so the waiter can reap the child before replacement.
-      wake_waiter.wait(lock, [] { return child_pid < 0; });
-    }
-  }
-  if (error == 0) {
-    if (waiter.joinable()) {
-      waiter.join();
-    }
-    error = posix_spawnp(&pid, program, &actions, nullptr, arguments, environ);
-  }
-  posix_spawn_file_actions_destroy(&actions);
+  const bool result = startPlayback(file, name, true, response);
   close(file);
-  if (error != 0) {
-    return reject(response, std::string("Cannot start aplay: ") + std::strerror(error));
-  }
-  child_pid = pid;
-  try {
-    waiter = std::thread(waitForPlayback, pid);
-  } catch (const std::exception& exception) {
-    kill(pid, SIGKILL);
-    while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
-    child_pid = -1;
-    return reject(response, std::string("Cannot start playback waiter: ") + exception.what());
-  }
-  response.success = true;
-  response.message = "Playback started";
-  ROS_INFO_STREAM("Playback started: " << name << " (device=" << audio_device << ")");
-  return true;
+  return result;
 }
+
+#ifdef UAV_AUDIO_WITH_TTS
+class TextToSpeech {
+ public:
+  bool load(const std::string& directory) {
+    const std::string model = directory + "/model.onnx";
+    const std::string tokens = directory + "/tokens.txt";
+    const std::string lexicon = directory + "/lexicon.txt";
+    const std::string date = directory + "/date.fst";
+    const std::string number = directory + "/number.fst";
+    for (const auto& path : {model, tokens, lexicon, date, number}) {
+      if (!std::ifstream(path).good()) {
+        ROS_ERROR_STREAM("Cannot read MeloTTS file: " << path);
+        return false;
+      }
+    }
+
+    const std::string rules = date + "," + number;
+    SherpaOnnxOfflineTtsConfig config{};
+    config.model.vits.model = model.c_str();
+    config.model.vits.tokens = tokens.c_str();
+    config.model.vits.lexicon = lexicon.c_str();
+    config.model.num_threads = 2;
+    config.model.provider = "cpu";
+    config.rule_fsts = rules.c_str();
+    tts_.reset(SherpaOnnxCreateOfflineTts(&config));
+    return static_cast<bool>(tts_);
+  }
+
+  bool say(uav_audio::Say::Request& request, uav_audio::Say::Response& response) {
+    const std::string& text = request.text;
+    if (text.size() > 512 || text.find('\0') != std::string::npos ||
+        text.find_first_not_of(" \t\r\n") == std::string::npos) {
+      return reject(response, "Provide non-empty text of at most 512 UTF-8 bytes");
+    }
+    std::unique_lock<std::mutex> lock(synthesis_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+      return reject(response, "TTS busy");
+    }
+
+    try {
+      const std::unique_ptr<const SherpaOnnxGeneratedAudio,
+                            decltype(&SherpaOnnxDestroyOfflineTtsGeneratedAudio)> audio(
+          SherpaOnnxOfflineTtsGenerate(tts_.get(), text.c_str(), 0, 1.0f),
+          SherpaOnnxDestroyOfflineTtsGeneratedAudio);
+      if (!audio || audio->n <= 0) {
+        return reject(response, "MeloTTS generated no audio");
+      }
+      std::vector<char> wav(SherpaOnnxWaveFileSize(audio->n));
+      SherpaOnnxWriteWaveToBuffer(audio->samples, audio->n, audio->sample_rate, wav.data());
+
+      const int fd = memfd_create("uav_audio_tts", MFD_CLOEXEC);
+      if (fd < 0) {
+        return reject(response, std::string("Cannot create TTS WAV: ") + std::strerror(errno));
+      }
+      const std::unique_ptr<FILE, decltype(&fclose)> file(fdopen(fd, "wb"), fclose);
+      if (!file) {
+        close(fd);
+        return reject(response, "Cannot open TTS WAV stream");
+      }
+      if (fwrite(wav.data(), 1, wav.size(), file.get()) != wav.size() ||
+          fseek(file.get(), 0, SEEK_SET) != 0) {
+        return reject(response, "Cannot write TTS WAV");
+      }
+      return startPlayback(fd, "MeloTTS", false, response);
+    } catch (const std::exception& error) {
+      return reject(response, std::string("MeloTTS failed: ") + error.what());
+    }
+  }
+
+ private:
+  std::mutex synthesis_mutex_;
+  std::unique_ptr<const SherpaOnnxOfflineTts, decltype(&SherpaOnnxDestroyOfflineTts)> tts_{
+      nullptr, SherpaOnnxDestroyOfflineTts};
+};
+#endif
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -159,7 +258,33 @@ int main(int argc, char** argv) {
   audio_directory = package_path + "/audio";
   const ros::ServiceServer service = node.advertiseService("/audio/play", play);
   ROS_INFO_STREAM("/audio/play ready (device=" << audio_device << ")");
+  std::string tts_model_dir;
+  private_node.getParam("tts_model_dir", tts_model_dir);
+#ifdef UAV_AUDIO_WITH_TTS
+  TextToSpeech tts;
+  ros::CallbackQueue tts_queue;
+  ros::AsyncSpinner tts_spinner(2, &tts_queue);
+  ros::NodeHandle tts_node;
+  tts_node.setCallbackQueue(&tts_queue);
+  ros::ServiceServer say_service;
+  if (!tts_model_dir.empty()) {
+    if (tts.load(tts_model_dir)) {
+      say_service = tts_node.advertiseService("/audio/say", &TextToSpeech::say, &tts);
+      tts_spinner.start();
+      ROS_INFO("/audio/say ready (MeloTTS zh_en)");
+    } else {
+      ROS_ERROR("MeloTTS unavailable");
+    }
+  }
+#else
+  if (!tts_model_dir.empty()) {
+    ROS_ERROR("MeloTTS requires a build with SHERPA_ONNX_ROOT");
+  }
+#endif
   ros::spin();
+#ifdef UAV_AUDIO_WITH_TTS
+  tts_spinner.stop();
+#endif
 
   // Stop our child before joining, even for very long WAVs. Never leave a child behind.
   {

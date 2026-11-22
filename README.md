@@ -61,6 +61,30 @@ rosservice call /audio/play "filename: '../sample-6s.wav'"
 
 添加自己的 WAV 时放到本包 `audio/` 目录，然后以其文件名调用服务。
 
+## 本地中文 TTS（可选）
+
+在 Jetson ARM64 上，将 [sherpa-onnx v1.12.27 CPU SDK](https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.27/sherpa-onnx-v1.12.27-linux-aarch64-shared-cpu.tar.bz2)
+和 [MeloTTS zh_en 模型](https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-melo-tts-zh_en.tar.bz2) 解压到工作区之外。
+运行时在本机 CPU 上离线合成，模型在节点启动时加载。
+
+```bash
+cd ~/devices_ws
+source /opt/ros/noetic/setup.bash
+catkin_make -DROS_EDITION=ROS1 -DSHERPA_ONNX_ROOT=/绝对路径/SDK解压目录 -j4
+source devel/setup.bash
+roslaunch uav_audio audio.launch audio_device:=pulse tts_model_dir:=/绝对路径/vits-melo-tts-zh_en
+```
+
+在另一个已加载工作区环境的终端调用：
+
+```bash
+rosservice call /audio/say "text: '系统已就绪。This is a test.'"
+```
+
+`/audio/say` 接受最多 512 字节的 UTF-8 文本，返回合成并启动播放的结果。
+一次合成一条。若合成完成时播放器正忙，本次播报返回失败。固定 WAV 仍可按原方式抢占播放。
+仅使用 WAV 时省略 `tts_model_dir`，也可将 `SHERPA_ONNX_ROOT` 置空以去掉编译依赖。
+
 ## 抢占播放自测（2026-11-01）
 
 在 WSL Ubuntu 20.04 / ROS Noetic 的独立 Master 上编译并验证：
